@@ -26,6 +26,7 @@ const uuid = 'd342d11e-d424-4583-b36e-524ab1f0afa4';//vless使用的uuid
 const passWordSha224 = '509eece82eb6910bebef9af9496092d3244b6c0d69ef3aaa4b12c565';
 const socks5AndHttpUser = 'admin';     //socsk5和http协议用户名，设置为空即为无密码验证，需要客户端也为空
 const socks5AndHttpPass = '123456';    //socsk5和http协议密码，设置为空即为无密码验证，需要客户端也为空
+const ssAeadPassword = '123456';       // ss协议 aes-128-gcm 密码（notls）
 // ---------------------------------------------------------------------------------
 // 理论最低带宽计算公式 (Theoretical Max Bandwidth Calculation):
 //    - 速度上限 (Mbps) = (bufferSize (字节) / flushTime (毫秒)) * 0.008
@@ -92,6 +93,142 @@ const binaryAddrToString = (addrType, addrBytes) => {
     let ipv6 = ((addrBytes[0] << 8) | addrBytes[1]).toString(16);
     for (let i = 1; i < 8; i++) ipv6 += ':' + ((addrBytes[i * 2] << 8) | addrBytes[i * 2 + 1]).toString(16);
     return `[${ipv6}]`;
+};
+const splitToAeadPayloads = (buf, max = 0x3FFF) => {
+    if (!buf?.length) return [];
+    if (buf.length <= max) return [buf];
+    const parts = [];
+    for (let i = 0; i < buf.length; i += max) parts.push(buf.subarray(i, Math.min(i + max, buf.length)));
+    return parts;
+};
+const incNonce = (nonce) => {
+    for (let i = 0; i < 12; i++) {
+        nonce[i] = (nonce[i] + 1) & 0xff;
+        if (nonce[i] !== 0) break;
+    }
+};
+const concatU8 = (arrs) => {
+    if (!arrs || arrs.length === 0) return new Uint8Array(0);
+    if (arrs.length === 1) return arrs[0];
+    let total = 0;
+    for (let i = 0; i < arrs.length; i++) total += arrs[i].length;
+    const out = new Uint8Array(total);
+    for (let i = 0, o = 0; i < arrs.length; i++) {
+        out.set(arrs[i], o);
+        o += arrs[i].length;
+    }
+    return out;
+};
+const parseSsTarget = (plain) => {
+    const len = plain.length;
+    if (len < 1) return null;
+    const addrType = plain[0];
+    const addrLen = addrType === 3 ? (len > 1 ? plain[1] : null) : addrType === 1 ? 4 : addrType === 4 ? 16 : -1;
+    if (addrLen === null || !(addrLen > 0)) return null;
+    const addrOffset = addrType === 3 ? 2 : 1;
+    const dataOffset = addrOffset + addrLen + 2;
+    if (len < dataOffset) return null;
+    const portOffset = dataOffset - 2;
+    const port = (plain[portOffset] << 8) | plain[portOffset + 1];
+    return {addrType, addrBytes: plain.subarray(addrOffset, addrOffset + addrLen), dataOffset, port, isDns: port === 53};
+};
+let ssMasterKeyPromise;
+const getSsMasterKey = () => ssMasterKeyPromise ||= (async () => {
+    const pwd = textEncoder.encode(ssAeadPassword);
+    const out = new Uint8Array(16);
+    let prev = new Uint8Array(0), offset = 0;
+    while (offset < 16) {
+        const input = new Uint8Array(prev.length + pwd.length);
+        if (prev.length) input.set(prev, 0);
+        input.set(pwd, prev.length);
+        prev = new Uint8Array(await crypto.subtle.digest('MD5', input));
+        const copyLen = Math.min(prev.length, 16 - offset);
+        out.set(prev.subarray(0, copyLen), offset);
+        offset += copyLen;
+    }
+    return out;
+})();
+const deriveSsSubKey = async (salt) => {
+    const masterKey = await getSsMasterKey();
+    const hkdfKey = await crypto.subtle.importKey('raw', masterKey, 'HKDF', false, ['deriveBits']);
+    const bits = await crypto.subtle.deriveBits({name: 'HKDF', hash: 'SHA-1', salt, info: textEncoder.encode('ss-subkey')}, hkdfKey, 128);
+    return new Uint8Array(bits);
+};
+const createSsAeadCtx = async (salt = crypto.getRandomValues(new Uint8Array(16))) => {
+    const subKey = await deriveSsSubKey(salt);
+    return {
+        salt,
+        key: await crypto.subtle.importKey('raw', subKey, {name: 'AES-GCM', length: 128}, false, ['encrypt', 'decrypt']),
+        nonce: new Uint8Array(12),
+        pending: new Uint8Array(0)
+    };
+};
+const decNonce = (nonce) => {
+    for (let i = 0; i < 12; i++) {
+        nonce[i] = (nonce[i] - 1) & 0xff;
+        if (nonce[i] !== 0xff) break;
+    }
+};
+const ssAeadDecryptFeed = async (ctx, chunk) => {
+    if (chunk?.length) ctx.pending = ctx.pending.length ? concatU8([ctx.pending, chunk]) : chunk;
+    const out = [];
+    while (ctx.pending.length >= 18) {
+        const lenCipher = ctx.pending.subarray(0, 18);
+        let lenPlain;
+        try {
+            lenPlain = new Uint8Array(await crypto.subtle.decrypt({name: 'AES-GCM', iv: ctx.nonce, tagLength: 128}, ctx.key, lenCipher));
+        } catch {throw new Error('ss length decrypt failed')}
+        incNonce(ctx.nonce);
+        const payloadLen = (lenPlain[0] << 8) | lenPlain[1];
+        if (payloadLen > 0x3FFF) throw new Error('ss payload too large');
+        const need = 18 + payloadLen + 16;
+        if (ctx.pending.length < need) {
+            decNonce(ctx.nonce);
+            break;
+        }
+        const payloadCipher = ctx.pending.subarray(18, need);
+        let payload;
+        try {
+            payload = new Uint8Array(await crypto.subtle.decrypt({name: 'AES-GCM', iv: ctx.nonce, tagLength: 128}, ctx.key, payloadCipher));
+        } catch {throw new Error('ss payload decrypt failed')}
+        incNonce(ctx.nonce);
+        out.push(payload);
+        ctx.pending = ctx.pending.subarray(need);
+    }
+    return out.length ? concatU8(out) : new Uint8Array(0);
+};
+const ssAeadEncryptChunks = async (ctx, data) => {
+    const chunks = splitToAeadPayloads(data);
+    if (!chunks.length) return new Uint8Array(0);
+    const out = [];
+    for (let i = 0; i < chunks.length; i++) {
+        const p = chunks[i], l = p.length;
+        const lenPlain = new Uint8Array([l >> 8, l & 0xff]);
+        const lenCipher = new Uint8Array(await crypto.subtle.encrypt({name: 'AES-GCM', iv: ctx.nonce, tagLength: 128}, ctx.key, lenPlain));
+        incNonce(ctx.nonce);
+        const dataCipher = new Uint8Array(await crypto.subtle.encrypt({name: 'AES-GCM', iv: ctx.nonce, tagLength: 128}, ctx.key, p));
+        incNonce(ctx.nonce);
+        out.push(lenCipher, dataCipher);
+    }
+    return concatU8(out);
+};
+const tryParseSsAeadInit = async (chunk) => {
+    try {
+        const salt = chunk.subarray(0, 16);
+        const decryptCtx = await createSsAeadCtx(salt);
+        const plain = await ssAeadDecryptFeed(decryptCtx, chunk.subarray(16));
+        const parsedRequest = parseSsTarget(plain);
+        if (!parsedRequest) return {success: false};
+        const encryptCtx = await createSsAeadCtx();
+        return {
+            success: true,
+            isShadowsocksAead: true,
+            parsedRequest,
+            firstPayload: plain.subarray(parsedRequest.dataOffset),
+            responseSalt: encryptCtx.salt,
+            ss: {inbound: decryptCtx, outbound: encryptCtx}
+        };
+    } catch {return {success: false}}
 };
 const parseHostPort = (addr, defaultPort) => {
     let host = addr, port = defaultPort, idx;
@@ -718,14 +855,14 @@ for (let i = 0; i < 60; i++) {
     else chunkIdxLookup[i] = 12;
 }
 const lowerBounds = new Uint16Array([1024, 1536, 2048, 2560, 3072, 3584, 4096, 5120, 6144, 7168, 8192, 12288, 20480, 28672]);
-const manualPipe = async (readable, writable) => {
+const smartPipeCore = async (readable, onFlush) => {
     const safeBufferSize = bufferSize - maxChunkLen;
     let buffer = new Uint8Array(bufferSize), chunkBuf = new ArrayBuffer(maxChunkLen);
     let offset = 0, totalBytes = 0, time = 2, timerId = null, resume = null;
     let globalCount = new Float64Array(14), globalBytes = new Float64Array(14);
     let statCount = 0, totalCount = 0, totalGlobalBytes = 0;
     const flushBuffer = () => {
-        offset > 0 && (writable.send(buffer.slice(0, offset)), offset = 0);
+        offset > 0 && (onFlush(buffer.slice(0, offset)), offset = 0);
         timerId && (clearTimeout(timerId), timerId = null), resume?.(), resume = null;
     };
     const reader = readable.getReader({mode: 'byob'});
@@ -734,7 +871,9 @@ const manualPipe = async (readable, writable) => {
             const {done, value} = await reader.read(new Uint8Array(chunkBuf));
             if (done) break;
             chunkBuf = value.buffer;
-            const chunkLen = value.byteLength, idx = chunkLen >= 30720 ? 13 : chunkIdxLookup[chunkLen >> 9];
+            const chunkLen = value.byteLength;
+            if (!chunkLen) continue;
+            const idx = chunkLen >= 30720 ? 13 : chunkIdxLookup[chunkLen >> 9];
             globalCount[idx]++, globalBytes[idx] += chunkLen;
             statCount++, totalCount++, totalGlobalBytes += chunkLen;
             if (statCount > 1000000) {
@@ -755,44 +894,103 @@ const manualPipe = async (readable, writable) => {
         }
     } finally {flushBuffer(), reader.releaseLock()}
 };
-const handleSession = async (chunk, state, request, writable, close) => {
+const manualPipe = async (readable, writable) => await smartPipeCore(readable, raw => writable.send(raw));
+const pipeWithSsAead = async (readable, writable, ssOutCtx, salt) => {
+    let flushPromise = Promise.resolve();
+    salt?.length && (flushPromise = flushPromise.then(() => writable.send(salt)));
+    try {
+        await smartPipeCore(readable, raw => {
+            flushPromise = flushPromise.then(async () => {
+                const encrypted = await ssAeadEncryptChunks(ssOutCtx, raw);
+                encrypted.byteLength && writable.send(encrypted);
+            });
+        });
+    } finally {await flushPromise}
+};
+const handleSession = async (chunk, state, request, writable, close, ssAead = false) => {
     state.needMore = false;
-    const parsed = parseProtocolChunk(chunk, state.socks5State);
-    parsed.handshake && writable.send(parsed.handshake);
-    if (!parsed.success) {
-        if (parsed.nextSocksState > 0) {
-            state.socks5State = parsed.nextSocksState;
-            return;
+    if (!state.tcpWriter && state.initBuffer?.length) chunk = concatU8([state.initBuffer, chunk]);
+    let parsedRequest, payload, isSs = false;
+    if (ssAead && !state.tcpWriter && state.socks5State === 0) {
+        const ssInit = await tryParseSsAeadInit(chunk);
+        if (ssInit.success) {
+            isSs = true;
+            state.initBuffer = null;
+            parsedRequest = ssInit.parsedRequest;
+            payload = ssInit.firstPayload;
+            state.ssInbound = ssInit.ss.inbound;
+            state.ssOutbound = ssInit.ss.outbound;
+            state.ssResponseSalt = ssInit.responseSalt;
         }
-        return parsed.needMore ? (state.needMore = true) : close();
     }
-    state.socks5State = 0;
-    const parsedRequest = parsed.parsedRequest;
-    const payload = chunk.subarray(parsedRequest.dataOffset);
+    if (!isSs) {
+        const parsed = parseProtocolChunk(chunk, state.socks5State);
+        parsed.handshake && writable.send(parsed.handshake);
+        if (!parsed.success) {
+            if (parsed.nextSocksState > 0) {
+                state.initBuffer = null;
+                state.socks5State = parsed.nextSocksState;
+                return;
+            }
+            if (parsed.needMore) {
+                state.initBuffer = chunk;
+                return state.needMore = true;
+            }
+            state.initBuffer = null;
+            return close();
+        }
+        state.initBuffer = null;
+        state.socks5State = 0;
+        parsedRequest = parsed.parsedRequest;
+        payload = chunk.subarray(parsedRequest.dataOffset);
+    }
     if (parsedRequest.isDns) {
         const dnsPack = await dohDnsHandler(payload);
-        if (dnsPack?.byteLength) writable.send(dnsPack);
+        if (dnsPack?.byteLength) {
+            if (isSs || state.ssOutbound) {
+                if (state.ssResponseSalt) {
+                    writable.send(state.ssResponseSalt);
+                    state.ssResponseSalt = null;
+                }
+                const encryptedDns = await ssAeadEncryptChunks(state.ssOutbound, dnsPack);
+                if (encryptedDns.byteLength) writable.send(encryptedDns);
+            } else {
+                writable.send(dnsPack);
+            }
+        }
         return close();
     } else {
         state.tcpSocket = await establishTcpConnection(parsedRequest, request);
         if (!state.tcpSocket) return close();
         const tcpWriter = state.tcpSocket.writable.getWriter();
         if (payload.byteLength) await tcpWriter.write(payload);
-        state.tcpWriter = (c) => tcpWriter.write(c);
+        if (isSs || state.ssInbound) {
+            state.tcpWriter = async (c) => {
+                const plain = await ssAeadDecryptFeed(state.ssInbound, c instanceof Uint8Array ? c : new Uint8Array(c));
+                if (plain.byteLength) await tcpWriter.write(plain);
+            };
+        } else {
+            state.tcpWriter = (c) => tcpWriter.write(c);
+        }
         if (state.tcpSocket.extra?.length) writable.send(state.tcpSocket.extra);
-        manualPipe(state.tcpSocket.readable, writable).finally(() => close());
+        if (isSs || state.ssOutbound) {
+            pipeWithSsAead(state.tcpSocket.readable, writable, state.ssOutbound, state.ssResponseSalt).finally(() => close());
+            state.ssResponseSalt = null;
+        } else {
+            manualPipe(state.tcpSocket.readable, writable).finally(() => close());
+        }
     }
 };
 const handleWebSocketConn = async (webSocket, request) => {
     const protocolHeader = request.headers.get('sec-websocket-protocol');
     // @ts-ignore
     const earlyData = protocolHeader ? Uint8Array.fromBase64(protocolHeader, {alphabet: 'base64url'}) : null;
-    const state = {socks5State: 0, tcpWriter: null, tcpSocket: null};
+    const state = {socks5State: 0, tcpWriter: null, tcpSocket: null, ssInbound: null, ssOutbound: null, ssResponseSalt: null, initBuffer: null};
     const close = () => {state.tcpSocket?.close(), !earlyData && webSocket.close()};
     let processingChain = Promise.resolve();
     const process = async (chunk) => {
         if (state.tcpWriter) return state.tcpWriter(chunk);
-        await handleSession(earlyData ? chunk : new Uint8Array(chunk), state, request, webSocket, close);
+        await handleSession(earlyData ? chunk : new Uint8Array(chunk), state, request, webSocket, close, true);
     };
     if (earlyData) processingChain = processingChain.then(() => process(earlyData).catch(close));
     webSocket.addEventListener("message", event => {processingChain = processingChain.then(() => process(event.data).catch(close))});
@@ -916,4 +1114,3 @@ export default {
         return new Response(html, {status: 200, headers: {'Content-Type': 'text/html; charset=UTF-8'}});
     }
 };
-
